@@ -24,12 +24,19 @@ try:
 except ImportError:
     from urlparse import urlparse
 
+from distutils.version import LooseVersion   #pylint: disable=import-error, no-name-in-module
+
+try:
+    from urllib.parse import urlparse
+except ImportError:
+    from urlparse import urlparse
+
 
 DEFAULT_CLUSTER_WAIT_TIMEOUT_IN_SECS = int(os.environ.get('CCM_CLUSTER_START_DEFAULT_TIMEOUT', 120))
 
 class Cluster(object):
 
-    def __init__(self, path, name, partitioner=None, install_dir=None, create_directory=True, version=None, verbose=False, derived_cassandra_version=None, **kwargs):
+    def __init__(self, path, name, partitioner=None, install_dir=None, create_directory=True, version=None, verbose=False, derived_cassandra_version=None, derived_dse_version=None, **kwargs):
         self.name = name
         self.nodes = {}
         self.seeds = []
@@ -41,6 +48,7 @@ class Cluster(object):
         self.__log_level = "INFO"
         self.__path = path
         self.__version = None
+        self.__dse_version = None
         self.use_vnodes = False
         # Classes that are to follow the respective logging level
         self._debug = []
@@ -56,6 +64,7 @@ class Cluster(object):
             version = kwargs['cassandra_version']
         if 'cassandra_dir' in kwargs:
             install_dir = kwargs['cassandra_dir']
+            install_dir = common.fix_bdp_dse_db_install_dir(install_dir)
         if create_directory:
             # we create the dir before potentially downloading to throw an error sooner if need be
             os.mkdir(self.get_path())
@@ -80,6 +89,12 @@ class Cluster(object):
                 else:
                     self.__version = self.__get_version_from_build()
 
+            if self.__dse_version is None:
+                if derived_dse_version is not None:
+                    self.__dse_version = derived_dse_version
+                else:
+                    self.__dse_version = self.__get_dse_version_from_build()
+
             if create_directory:
                 common.validate_install_dir(self.__install_dir)
                 self._update_config()
@@ -103,6 +118,7 @@ class Cluster(object):
 
     def set_install_dir(self, install_dir=None, version=None, verbose=False):
         if version is None:
+            install_dir = common.fix_bdp_dse_db_install_dir(install_dir)
             self.__install_dir = install_dir
             common.validate_install_dir(install_dir)
             self.__version = self.__get_version_from_build()
@@ -112,6 +128,7 @@ class Cluster(object):
             self.__version = v if v is not None else self.__get_version_from_build()
             if not isinstance(self.__version, LooseVersion):
                 self.__version = LooseVersion(self.__version)
+        self.__dse_version = self.__get_dse_version_from_build()
         self._update_config()
         for node in list(self.nodes.values()):
             node._cassandra_version = self.__version
@@ -119,7 +136,7 @@ class Cluster(object):
 
         # if any nodes have a data center, let's update the topology
         if any([node.data_center for node in self.nodes.values()]):
-            self.__update_topology_files()
+            self.update_topology_files()
 
         if self.cassandra_version() >= '4':
             self.set_configuration_options({ 'start_rpc' : None}, delete_empty=True, delete_always=True)
@@ -222,11 +239,40 @@ class Cluster(object):
     def nodelist(self):
         return [self.nodes[name] for name in sorted(self.nodes.keys())]
 
+    @staticmethod
+    def _sanitize_version(version):
+        """
+        LooseVersion doesn't work well with versions that contain non-integer parts, especially
+        when comparing the different components.
+
+        This method returns only the major.minor if it finds string components in the version.
+        """
+        if version is None:
+            return
+
+        if not isinstance(version, LooseVersion):
+            version = LooseVersion(version)
+
+        if (len(version.version) > 1 and
+            not all([isinstance(c, int) for c in version.version])):
+            version = LooseVersion("%s.%s" % (version.version[0], version.version[1]))
+
+        return version
+
     def version(self):
         return self.__version
 
     def cassandra_version(self):
-        return self.version()
+        return self._sanitize_version(self.version())
+
+    def dse_version(self):
+        return self._sanitize_version(self.__dse_version)
+
+    def is_dse_cluster(self):
+        if self.dse_version() and self.cassandra_version():
+            return self.dse_version() != self.cassandra_version()
+        else:
+            return bool(self.dse_version())
 
     def address_regex(self):
         return "/([0-9.]+):7000" if self.cassandra_version() >= '4.0' else "/([0-9.]+)"
@@ -252,17 +298,19 @@ class Cluster(object):
             node.set_log_level("TRACE", trace_class)
 
         if data_center is not None:
-            self.__update_topology_files()
+            self.update_topology_files()
 
         node._save()
         return self
 
-    def populate(self, nodes, debug=False, tokens=None, use_vnodes=None, ipprefix='127.0.0.', ipformat=None, install_byteman=False, use_single_interface=False):
-        """Populate a cluster with nodes
+    def populate(self, nodes, debug=False, tokens=None, use_vnodes=False, ipprefix='127.0.0.', ipformat=None, install_byteman=False, use_single_interface=False):
+        """
+        Populate a cluster with nodes
+
         @use_single_interface : Populate the cluster with nodes that all share a single network interface.
         """
 
-        if self.cassandra_version() < '4' and use_single_interface:
+        if use_single_interface and self.cassandra_version() < '4':
             raise common.ArgumentError('use_single_interface is not supported in versions < 4.0')
 
         node_count = nodes
@@ -310,6 +358,13 @@ class Cluster(object):
         if not ipformat:
             ipformat = ipprefix + "%d"
 
+        port = 9042
+        if use_single_interface:
+            # set the starting port if specified
+            starting_port = os.environ.get('CCM_SINGLE_INTERFACE_STARTING_PORT', None)
+            if starting_port:
+                port = int(starting_port) - 4 # first node will use starting_port
+
         for i in xrange(1, node_count + 1):
             tk = None
             if tokens is not None and i - 1 < len(tokens):
@@ -319,11 +374,11 @@ class Cluster(object):
             binary = None
             if self.cassandra_version() >= '1.2':
                 if use_single_interface:
-                    #Always leave 9042 and 9043 clear, in case someone defaults to adding
+                    # Always leave 9042 and 9043 clear, in case someone defaults to adding
                     # a node with those ports
-                    binary = (ipformat % 1, 9042 + 2 + (i * 2))
+                    binary = (ipformat % 1, port + 2 + (i * 2))
                 else:
-                    binary = (ipformat % i, 9042)
+                    binary = (ipformat % i, port)
             thrift = None
             if self.cassandra_version() < '4':
                 thrift = (ipformat % i, 9160)
@@ -348,8 +403,8 @@ class Cluster(object):
             self._update_config()
         return self
 
-    def create_node(self, name, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save=True, binary_interface=None, byteman_port='0', environment_variables=None, derived_cassandra_version=None):
-        return Node(name, self, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save, binary_interface, byteman_port, environment_variables, derived_cassandra_version=derived_cassandra_version)
+    def create_node(self, name, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save=True, binary_interface=None, byteman_port='0', environment_variables=None, derived_cassandra_version=None, derived_dse_version=None):
+        return Node(name, self, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save, binary_interface, byteman_port, environment_variables, derived_cassandra_version=derived_cassandra_version, derived_dse_version=derived_dse_version)
 
     def balanced_tokens(self, node_count):
         if self.cassandra_version() >= '1.2' and (not self.partitioner or 'Murmur3' in self.partitioner):
@@ -457,7 +512,7 @@ class Cluster(object):
         return os.path.join(self.__path, self.name)
 
     def get_seeds(self):
-        if self.cassandra_version() >= '4.0':
+        if not self.is_dse_cluster() and self.cassandra_version() >= '4.0':
             #They might be overriding the storage port config now
             storage_port = self._config_options.get("storage_port")
             storage_interfaces = [s.network_interfaces['storage'] for s in self.seeds if isinstance(s, Node)]
@@ -533,6 +588,8 @@ class Cluster(object):
                     time.sleep(1)
 
                 started.append((node, p, mark))
+
+        self.__update_pids(started)
 
         if no_wait:
             time.sleep(2)  # waiting 2 seconds to check for early errors and for the pid to be set
@@ -641,10 +698,11 @@ class Cluster(object):
             if '-d' not in stress_options:
                 nodes_options = ['-d', live_node_ips_joined()]
             args = [stress] + nodes_options + stress_options
-        elif self.cassandra_version() >= '4.0':
+        elif not self.is_dse_cluster() and self.cassandra_version() >= '4.0':
+            args = [stress] + stress_options
             if '-node' not in stress_options:
-                nodes_options = ['-node', ','.join([node[0] + ':' + str(node[1]) for node in livenodes])]
-            args = [stress] + stress_options + nodes_options
+                args += ['-node']
+                args += [",".join([node[0] + ":" + str(node[1]) for node in livenodes])]
         else:
             if '-node' not in stress_options:
                 nodes_options = ['-node', live_node_ips_joined()]
@@ -665,7 +723,7 @@ class Cluster(object):
             self._config_options = common.merge_configuration(self._config_options, values, delete_empty=delete_empty, delete_always=delete_always)
 
         self._persist_config()
-        self.__update_topology_files()
+        self.update_topology_files()
         return self
 
     def set_batch_commitlog(self, enabled):
@@ -740,6 +798,9 @@ class Cluster(object):
     def __get_version_from_build(self):
         return common.get_version_from_build(self.get_install_dir())
 
+    def __get_dse_version_from_build(self):
+        return common.get_dse_version_from_build_safe(self.get_install_dir())
+
     def _update_config(self):
         node_list = [node.name for node in list(self.nodes.values())]
         seed_list = self.get_seeds()
@@ -767,7 +828,7 @@ class Cluster(object):
         for node, p, _ in started:
             node._update_pid(p)
 
-    def __update_topology_files(self):
+    def update_topology_files(self):
         dcs = [('default', 'dc1')]
         for node in self.nodelist():
             if node.data_center is not None:
@@ -807,7 +868,7 @@ class Cluster(object):
             'truststore_password': 'cassandra'
         }
 
-        if self.cassandra_version() >= '4.0':
+        if not self.dse_version() and self.cassandra_version() >= '4.0':
             node_ssl_options['enabled'] = True
 
         self._config_options['server_encryption_options'] = node_ssl_options

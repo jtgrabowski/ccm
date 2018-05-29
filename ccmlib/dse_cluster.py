@@ -6,9 +6,6 @@ import os
 import shutil
 import signal
 import subprocess
-import sys
-
-from six import iteritems, print_
 
 from ccmlib import common, repository
 from ccmlib.cluster import Cluster
@@ -69,16 +66,26 @@ class DseCluster(Cluster):
     def hasOpscenter(self):
         return os.path.exists(os.path.join(self.get_path(), 'opscenter'))
 
-    def create_node(self, name, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save=True, binary_interface=None, byteman_port='0', environment_variables=None,derived_cassandra_version=None):
-        return DseNode(name, self, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save, binary_interface, byteman_port, environment_variables=environment_variables, derived_cassandra_version=derived_cassandra_version)
+    def create_node(self, name, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save=True, binary_interface=None, byteman_port='0', environment_variables=None, derived_cassandra_version=None, **kwargs):
+        return DseNode(name, self, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save, binary_interface, byteman_port, environment_variables=environment_variables, derived_cassandra_version=derived_cassandra_version, **kwargs)
 
-    def start(self, no_wait=False, verbose=False, wait_for_binary_proto=False, wait_other_notice=True, jvm_args=None, profile_options=None, quiet_start=False, allow_root=False):
+    def start(self, no_wait=False, verbose=False, wait_for_binary_proto=False, wait_other_notice=True, jvm_args=None,
+              profile_options=None, quiet_start=False, allow_root=False, jvm_version=None):
         if jvm_args is None:
             jvm_args = []
+
+        if (wait_for_binary_proto and 1 <= len(self.nodes) <= 3 and
+                all(not arg.startswith('-Ddse.stability.checkIntervalMs') for arg in jvm_args)):
+            # DSE waits 10s for gossip to settle before listening to client connections.
+            # For single node clusters, this wait is unnecessary as there are no other nodes.
+            # For 2 or 3 node clusters, we can reduce the wait time as these are all nodes listening in the local
+            # interface.
+            jvm_args += ['-Ddse.stability.checkIntervalMs={}'.format((len(self.nodes) -1) * 3000)]
+
         marks = {}
         for node in self.nodelist():
             marks[node] = node.mark_log()
-        started = super(DseCluster, self).start(no_wait, verbose, wait_for_binary_proto, wait_other_notice, jvm_args, profile_options, quiet_start=quiet_start, allow_root=allow_root, timeout=180)
+        started = super(DseCluster, self).start(no_wait, verbose, wait_for_binary_proto, wait_other_notice, jvm_args, profile_options, quiet_start=quiet_start, allow_root=allow_root, timeout=180, jvm_version=jvm_version)
         self.start_opscenter()
         if self._misc_config_options.get('enable_aoss', False):
             self.wait_for_any_log('AlwaysOn SQL started', 600, marks=marks)
@@ -99,8 +106,11 @@ class DseCluster(Cluster):
             self._cassandra_version = common.get_dse_cassandra_version(self.get_install_dir())
         return self._cassandra_version
 
+    def dse_version(self):
+        return self.version()
+
     def enable_aoss(self):
-        if self.version() < '6.0':
+        if self.dse_version() < '6.0':
             common.error("Cannot enable AOSS in DSE clusters before 6.0")
             exit(1)
         self._misc_config_options['enable_aoss'] = True

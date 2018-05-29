@@ -112,7 +112,8 @@ class Node(object):
                  byteman_port='0',
                  environment_variables=None,
                  byteman_startup_script=None,
-                 derived_cassandra_version=None):
+                 derived_cassandra_version=None,
+                 derived_dse_version=None):
         """
         Create a new Node.
           - name: the name for that node
@@ -160,6 +161,14 @@ class Node(object):
             except common.CCMError:
                 self._cassandra_version = self.cluster.cassandra_version()
 
+        if derived_dse_version:
+            self._dse_version = derived_dse_version
+        else:
+            try:
+                self._dse_version = common.get_dse_version_from_build_safe(self.get_install_dir())
+            except common.CCMError:
+                self._dse_version = self.cluster.dse_version()
+
         if save:
             self.import_config_files()
             self.import_bin_files()
@@ -184,6 +193,9 @@ class Node(object):
             cassandra_version = None
             if 'cassandra_version' in data:
                 cassandra_version = LooseVersion(data['cassandra_version'])
+            dse_version = None
+            if 'dse_version' in data:
+                dse_version = LooseVersion(data['dse_version'])
             remote_debug_port = 2000
             if 'remote_debug_port' in data:
                 remote_debug_port = data['remote_debug_port']
@@ -193,7 +205,7 @@ class Node(object):
             thrift_interface = None
             if 'thrift' in itf and itf['thrift'] is not None:
                 thrift_interface = tuple(itf['thrift'])
-            node = cluster.create_node(data['name'], data['auto_bootstrap'], thrift_interface, tuple(itf['storage']), data['jmx_port'], remote_debug_port, initial_token, save=False, binary_interface=binary_interface, byteman_port=data['byteman_port'], derived_cassandra_version=cassandra_version)
+            node = cluster.create_node(data['name'], data['auto_bootstrap'], thrift_interface, tuple(itf['storage']), data['jmx_port'], remote_debug_port, initial_token, save=False, binary_interface=binary_interface, byteman_port=data['byteman_port'], derived_cassandra_version=cassandra_version, derived_dse_version=dse_version)
             node.status = data['status']
             if 'pid' in data:
                 node.pid = int(data['pid'])
@@ -241,8 +253,11 @@ class Node(object):
                                          cassandra_version=self.cluster.cassandra_version(),
                                          env=env,
                                          info_message=self.name)
+        # Need to update the node's environment for nodetool and other tools.
+        # (e.g. the host's JAVA_HOME points to Java 11, but the node's software is only for Java 8)
         for (key, value) in self.__environment_variables.items():
-            env[key] = value
+            if key not in ['JAVA_HOME', 'PATH']:
+                env[key] = value
         return env
 
     def get_install_cassandra_root(self):
@@ -261,7 +276,7 @@ class Node(object):
         """
         Returns the address formatted for the current version (InetAddress/InetAddressAndPort.toString)
         """
-        if self.get_cassandra_version() >= '4.0':
+        if not self.is_dse_node() and self.get_cassandra_version() >= '4.0':
             return "/{}".format(str(self.address_and_port()))
         else:
             return "/{}".format(str(self.address()));
@@ -271,7 +286,7 @@ class Node(object):
         Returns the address formatted for the specified (InetAddress.getHostAddress or
         InetAddressAndPort.getHostAddressAndPort)
         """
-        if version >= '4.0':
+        if not self.is_dse_node() and version >= '4.0':
             return self.address_and_port()
         else:
             return "{}".format(str(self.address()));
@@ -318,6 +333,7 @@ class Node(object):
         Sets the path to the cassandra source directory for use by this node.
         """
         if version is None:
+            install_dir = common.fix_bdp_dse_db_install_dir(install_dir)
             self.__install_dir = install_dir
             if install_dir is not None:
                 common.validate_install_dir(install_dir)
@@ -325,6 +341,7 @@ class Node(object):
             self.__install_dir = self.node_setup(version, verbose=verbose)
 
         self._cassandra_version = common.get_version_from_build(self.__install_dir, cassandra=True)
+        self._dse_version = common.get_dse_version_from_build_safe(self.__install_dir)
 
         if self.get_base_cassandra_version() >= 4.0:
             self.network_interfaces['thrift'] = None
@@ -346,6 +363,15 @@ class Node(object):
 
     def get_cassandra_version(self):
         return self._cassandra_version
+
+    def get_dse_version(self):
+        return self._dse_version
+
+    def is_dse_node(self):
+        if self.get_dse_version() and self.get_cassandra_version():
+            return self.get_dse_version() != self.get_cassandra_version()
+        else:
+            return bool(self.get_dse_version())
 
     def get_base_cassandra_version(self):
         version = self.get_cassandra_version()
@@ -649,7 +675,7 @@ class Node(object):
         the log is watched from the beginning.
         """
         tofind = nodes if isinstance(nodes, list) else [nodes]
-        tofind = ["%s is now [dead|DOWN]" % node.address_for_version(self.get_cassandra_version()) for node in tofind]
+        tofind = ["%s.* now [dead|DOWN]" % node.address_for_version(self.get_cassandra_version()) for node in tofind]
         self.watch_log_for(tofind, from_mark=from_mark, timeout=timeout, filename=filename)
 
     def watch_log_for_alive(self, nodes, from_mark=None, timeout=120, filename='system.log'):
@@ -723,7 +749,6 @@ class Node(object):
 
     def start(self,
               join_ring=True,
-              no_wait=False,
               verbose=False,
               update_pid=True,
               wait_other_notice=True,
@@ -740,8 +765,7 @@ class Node(object):
         """
         Start the node. Options includes:
           - join_ring: if false, start the node with -Dcassandra.join_ring=False
-          - no_wait: by default, this method returns when the node is started and listening to clients.
-            If no_wait=True, the method returns sooner.
+          - wait_for_binary_proto: if true, this method returns when the node is started and listening to clients.
           - wait_other_notice: if truthy, this method returns only when all other live node of the cluster
             have marked this node UP. if an integer, sets the timeout for how long to wait
           - replace_token: start the node with the -Dcassandra.replace_token option.
@@ -808,7 +832,7 @@ class Node(object):
 
         args = args + ['-p', pidfile, '-Dcassandra.join_ring=%s' % str(join_ring)]
 
-        args.append('-Dcassandra.logdir=%s' % os.path.join(self.get_path(), 'logs'))
+        args.append('-Dcassandra.logdir=%s' % self.log_directory())
         if replace_token is not None:
             args.append('-Dcassandra.replace_token=%s' % str(replace_token))
         if replace_address is not None:
@@ -974,6 +998,21 @@ class Node(object):
                 return True
         else:
             return False
+
+    def wait_for_node_stopped(self, timeout=120):
+        """
+        Wait until the node is stopped.
+        Useful when stopping a node without waiting until it has stopped.
+
+        Unlike the old variant in stop(), this implementation does not use an exponential backoff to check
+        whether the node has stopped to reduce the duration of all tests.
+        """
+        timeout = time.time() + timeout
+        while timeout > time.time():
+            time.sleep(0.5)
+            if not self.is_running():
+                return True
+        raise NodeError("Problem stopping node {} in cluster {}".format(self.name, self.cluster.name))
 
     def wait_for_compactions(self, timeout=120):
         """
@@ -1660,7 +1699,10 @@ class Node(object):
             os.mkdir(dir_name)
             for dir in self._get_directories():
                 os.mkdir(dir)
-
+        try:
+            self._cassandra_version = common.get_version_from_build(self.get_install_dir(), cassandra=True)
+        except common.CCMError:
+            self._cassandra_version = self.cluster.cassandra_version()
         filename = os.path.join(dir_name, 'node.conf')
         values = {
             'name': self.name,
@@ -1693,7 +1735,7 @@ class Node(object):
     def _update_yaml(self):
         conf_file = os.path.join(self.get_conf_dir(), common.CASSANDRA_CONF)
         with open(conf_file, 'r') as f:
-            data = yaml.safe_load(f)
+            data = yaml.load(f)
 
         with open(conf_file, 'r') as f:
             yaml_text = f.read()
@@ -1719,7 +1761,7 @@ class Node(object):
         data['commitlog_directory'] = os.path.join(self.get_path(), 'commitlogs')
         data['saved_caches_directory'] = os.path.join(self.get_path(), 'saved_caches')
 
-        if 'metadata_directory' in data:
+        if self.get_dse_version() >= '6.8' and 'metadata_directory' in yaml_text:
             data['metadata_directory'] = os.path.join(self.get_path(), 'metadata')
 
         if self.get_cassandra_version() > '3.0' and 'hints_directory' in yaml_text:
@@ -1768,6 +1810,14 @@ class Node(object):
     def __update_logback(self):
         conf_file = os.path.join(self.get_conf_dir(), common.LOGBACK_CONF)
 
+        # Configure logback to not limit the log file size to prevent log file rotation.
+        # The logback re-configuration is done by updating the logback config file.
+        #
+        # Rotating log files can cause intermittent test failures when log messages cannot be caught
+        # by watch_log_for() and related functions. See DB-2759
+        if common.DONT_ROTATE_LOGFILES:
+            common.set_logback_no_rotation(conf_file)
+
         self.__update_logback_loglevel(conf_file)
 
         tools_conf_file = os.path.join(self.get_conf_dir(), common.LOGBACK_TOOLS_CONF)
@@ -1808,17 +1858,20 @@ class Node(object):
             common.replace_or_add_into_file_tail(conf_file, full_logger_pattern, logger_pattern + class_name + '" level="' + self.__classes_log_level[class_name] + '"/>')
 
     def __update_envfile(self):
-        agentlib_setting = '-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address={}'.format(str(self.remote_debug_port))
+        agentlib_setting = '-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address={}' \
+                           .format(str(self.remote_debug_port)) if self.remote_debug_port else ''
         remote_debug_options = agentlib_setting
         # The cassandra-env.ps1 file has been introduced in 2.1
         if common.is_modern_windows_install(self.get_base_cassandra_version()):
             conf_file = os.path.join(self.get_conf_dir(), common.CASSANDRA_WIN_ENV)
+            jvm_dep_file = None
             jmx_port_pattern = '^\s+\$JMX_PORT='
             jmx_port_setting = '    $JMX_PORT="' + self.jmx_port + '"'
             if self.get_cassandra_version() < '3.2':
                 remote_debug_options = '    $env:JVM_OPTS="$env:JVM_OPTS {}"'.format(agentlib_setting)
         else:
             conf_file = os.path.join(self.get_conf_dir(), common.CASSANDRA_ENV)
+            jvm_dep_file = os.path.join(self.get_conf_dir(), common.JVM_DEPENDENT_SH)
             jmx_port_pattern = 'JMX_PORT='
             jmx_port_setting = 'JMX_PORT="' + self.jmx_port + '"'
             if self.get_cassandra_version() < '3.2':
@@ -1846,7 +1899,8 @@ class Node(object):
 
         if self.byteman_port != '0':
             byteman_jar = glob.glob(os.path.join(self.get_install_dir(), 'build', 'lib', 'jars', 'byteman-[0-9]*.jar'))[0]
-            agent_string = "-javaagent:{}=listener:true,boot:{},port:{}".format(byteman_jar, byteman_jar, str(self.byteman_port))
+            agent_string = "-javaagent:{}=listener:true,boot:{},address:{},port:{}".format(byteman_jar, byteman_jar,
+                                                                                           self.network_interfaces['binary'][0], str(self.byteman_port))
             if self.byteman_startup_script is not None:
                 agent_string = agent_string + ",script:{}".format(self.byteman_startup_script)
             if common.is_modern_windows_install(self.get_base_cassandra_version()):
@@ -1866,23 +1920,18 @@ class Node(object):
 
         # gc.log was turned on by default in 2.2.5/3.0.3/3.3
         if self.get_cassandra_version() >= '2.2.5':
-            gc_log_pattern = "-Xloggc"
-            gc_log_path = os.path.join(self.log_directory(), 'gc.log')
-            if common.is_win():
-                gc_log_setting = '    $env:JVM_OPTS="$env:JVM_OPTS -Xloggc:{}"'.format(gc_log_path)
-            else:
-                gc_log_setting = 'JVM_OPTS="$JVM_OPTS -Xloggc:{}"'.format(gc_log_path)
+            # Fix log path in cassandra-env.* and jvm-dependent.*
+            #
+            # Handles both the ${CASSANDRA_HOME}/logs and ${CASSANDRA_LOG_DIR} cases.
+            # Tested for Linux, should work for Windows as well.
 
-            common.replace_in_file(conf_file, gc_log_pattern, gc_log_setting)
+            log_path = self.log_directory()
 
-            # Java 9
-            gc_log_pattern = "-Xlog[:]gc=info"
-            if common.is_win():
-                gc_log_setting = '    $env:JVM_OPTS="$env:JVM_OPTS -Xlog:gc=info,heap=trace,age=debug,safepoint=info,promotion=trace:file={}:time,uptime,pid,tid,level:filecount=10,filesize=10240"'.format(gc_log_path)
-            else:
-                gc_log_setting = 'JVM_OPTS="$JVM_OPTS -Xlog:gc=info,heap=trace,age=debug,safepoint=info,promotion=trace:file={}:time,uptime,pid,tid,level:filecount=10,filesize=10240"'.format(gc_log_path)
-
-            common.replace_in_file(conf_file, gc_log_pattern, gc_log_setting)
+            common.substitute_in_files([conf_file, jvm_dep_file],
+                                       [['[$][{]CASSANDRA_HOME[}]/logs', log_path],
+                                        ['[$][{]CASSANDRA_LOG_DIR[}]', log_path],
+                                        ['[$]env[:]CASSANDRA_HOME/logs', log_path],
+                                        ['[$]env[:]CASSANDRA_LOG_DIR', log_path]])
 
         for itf in list(self.network_interfaces.values()):
             if itf is not None and common.interface_is_ipv6(itf):
@@ -2083,6 +2132,11 @@ class Node(object):
             raise NodeError('Problem starting node %s due to %s' % (self.name, e), process)
         self.__update_status()
 
+        if not self.is_running():
+            if not common.is_win():
+                print_proc_stderr(self.name, process)
+            raise NodeError("Error starting node {}.".format(self.name), process)
+
     def __gather_sstables(self, datafiles=None, keyspace=None, columnfamilies=None):
         files = []
         if keyspace is None:
@@ -2181,16 +2235,12 @@ class Node(object):
 
     def byteman_submit_process(self, opts):
         cdir = self.get_install_dir()
-        byteman_cmd = []
-        byteman_cmd.append(os.path.join(os.environ['JAVA_HOME'],
-                                        'bin',
-                                        'java'))
-        byteman_cmd.append('-cp')
-        byteman_cmd.append(glob.glob(os.path.join(cdir, 'build', 'lib', 'jars', 'byteman-submit-[0-9]*.jar'))[0])
-        byteman_cmd.append('org.jboss.byteman.agent.submit.Submit')
-        byteman_cmd.append('-p')
-        byteman_cmd.append(self.byteman_port)
-        byteman_cmd += opts
+        byteman_cmd = [os.path.join(os.environ['JAVA_HOME'], 'bin', 'java'),
+                       '-cp',
+                       glob.glob(os.path.join(cdir, 'build', 'lib', 'jars', 'byteman-submit-[0-9]*.jar'))[0],
+                       'org.jboss.byteman.agent.submit.Submit',
+                       '-p', self.byteman_port,
+                       '-h', self.network_interfaces['binary'][0]] + opts
         return subprocess.Popen(byteman_cmd)
 
     def byteman_submit(self, opts):
@@ -2304,3 +2354,63 @@ def handle_external_tool_process(process, cmd_args):
 
     ret = namedtuple('Subprocess_Return', 'stdout stderr rc')
     return ret(stdout=out, stderr=err, rc=rc)
+
+
+def print_proc_stderr(node_name, proc):
+    # If stderr_file exists on the process, we opted to
+    # store stderr in a separate temporary file, consume that.
+    if hasattr(proc, 'stderr_file') and proc.stderr_file is not None:
+        proc.stderr_file.seek(0)
+        stderr = proc.stderr_file.read()
+    else:
+        try:
+            stderr = proc.communicate()[1]
+        except ValueError:
+            stderr = ''
+
+    if len(stderr) > 1:
+        print_("[{} ERROR] {}".format(node_name, stderr.strip()))
+
+
+def stop_multiple_nodes(nodes):
+    for node in nodes:
+        common.debug("Stopping node {} in cluster {}...".format(node.name, node.cluster.name))
+        node.stop(wait=False)
+    for node in nodes:
+        node.wait_for_node_stopped()
+        common.debug("Node {} in cluster {} stopped.".format(node.name, node.cluster.name))
+
+
+def start_multiple_nodes(nodes, dont_wait=False, **kwargs):
+    """
+    Start multiple nodes and wait for the binary interface to be ready.
+    Useful to start multiple nodes in parallel.
+
+    :param nodes: nodes to start
+    :param dont_wait: if True, do not call wait_for_multiple_binary_interface(nodes)
+    :param kwargs: arguments for Node.start()
+    """
+    for node in nodes:
+        common.debug("Starting node {} in cluster {} on C* {} / DSE {}...".format(node.name, node.cluster.name,
+                                                                                  node.get_cassandra_version(),
+                                                                                  node.get_dse_version()))
+        node.start(**kwargs)
+
+    if not dont_wait:
+        # Cannot pass **kwargs here, as the arguments for Node.start and Node.wait_for_binary
+        # interface are incompatible.
+        wait_for_multiple_binary_interface(nodes)
+
+
+def wait_for_multiple_binary_interface(nodes, **kwargs):
+    """
+    Call wait_for_binary_interface() on multiple nodes.
+
+    :param nodes: nodes to start
+    :param kwargs: arguments for Node.wait_for_binary_interface()
+    """
+    for node in nodes:
+        node.wait_for_binary_interface(from_mark=node.mark, **kwargs)
+        common.debug("Node {} in cluster {} started on C* {} / DSE {}".format(node.name, node.cluster.name,
+                                                                              node.get_cassandra_version(),
+                                                                              node.get_dse_version()))

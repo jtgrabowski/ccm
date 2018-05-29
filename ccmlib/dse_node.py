@@ -5,16 +5,12 @@ import os
 import re
 import shutil
 import signal
-import stat
 import subprocess
-import time
 
 import yaml
-from six import iteritems, print_
 
 from ccmlib import common, extension, repository
-from ccmlib.node import (Node, NodeError, ToolError,
-                         handle_external_tool_process)
+from ccmlib.node import (Node, handle_external_tool_process)
 
 
 class DseNode(Node):
@@ -23,8 +19,8 @@ class DseNode(Node):
     Provides interactions to a DSE node.
     """
 
-    def __init__(self, name, cluster, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save=True, binary_interface=None, byteman_port='0', environment_variables=None, derived_cassandra_version=None):
-        super(DseNode, self).__init__(name, cluster, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save, binary_interface, byteman_port, environment_variables=environment_variables, derived_cassandra_version=derived_cassandra_version)
+    def __init__(self, name, cluster, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save=True, binary_interface=None, byteman_port='0', environment_variables=None, derived_cassandra_version=None, **kwargs):
+        super(DseNode, self).__init__(name, cluster, auto_bootstrap, thrift_interface, storage_interface, jmx_port, remote_debug_port, initial_token, save, binary_interface, byteman_port, environment_variables=environment_variables, derived_cassandra_version=derived_cassandra_version, **kwargs)
        
         self._dse_config_options = {}
         if self.cluster.hasOpscenter():
@@ -131,7 +127,6 @@ class DseNode(Node):
 
     def start(self,
               join_ring=True,
-              no_wait=False,
               verbose=False,
               update_pid=True,
               wait_other_notice=True,
@@ -146,7 +141,7 @@ class DseNode(Node):
               set_migration_task=True,
               jvm_version=None):
         mark = self.mark_log()
-        process = super(DseNode, self).start(join_ring, no_wait, verbose, update_pid, wait_other_notice, replace_token,
+        process = super(DseNode, self).start(join_ring, verbose, update_pid, wait_other_notice, replace_token,
                                              replace_address, jvm_args, wait_for_binary_proto, profile_options, use_jna,
                                              quiet_start, allow_root, set_migration_task, jvm_version)
         if self.cluster.hasOpscenter():
@@ -163,6 +158,14 @@ class DseNode(Node):
     def stop(self, wait=True, wait_other_notice=False, signal_event=signal.SIGTERM, **kwargs):
         if self.cluster.hasOpscenter():
             self._stop_agent()
+
+        try:
+            with open("{}/dse-collectd.pid".format(self.log_directory()), 'r') as f:
+                collectd_pid = int(f.readline().strip())
+                os.kill(collectd_pid, signal.SIGKILL if 'gently' in kwargs and kwargs['gently'] is False else signal.SIGTERM)
+        except Exception as e:
+            common.debug("Tried to shut down collectd, but could not: {}".format(str(e)))
+
         return super(DseNode, self).stop(wait=wait, wait_other_notice=wait_other_notice, signal_event=signal_event, **kwargs)
 
     def _stop_agent(self):
@@ -413,6 +416,8 @@ class DseNode(Node):
         dirs = []
         for i in ['data', 'commitlogs', 'saved_caches', 'logs', 'bin', 'keys', 'resources', os.path.join('data', 'hints')]:
             dirs.append(os.path.join(self.get_path(), i))
+        if self.cluster.version() >= '6.8':
+            dirs.append(os.path.join(self.get_path(), 'metadata'))
         return dirs
 
     def _copy_agent(self):

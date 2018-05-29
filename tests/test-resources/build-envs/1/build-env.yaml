@@ -1,0 +1,12 @@
+# build-env.yaml as of DB-468
+# for tests.test_common.TestCommon#test_update_java_version
+
+java_build_versions:
+  - 11
+  - 8
+
+java_runtime_versions:
+  - 8
+  - 11
+  - 12
+  - 13

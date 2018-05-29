@@ -23,7 +23,7 @@ except ImportError:
     import configparser as ConfigParser
 
 from ccmlib import common
-from ccmlib.common import (ArgumentError, CCMError,
+from ccmlib.common import (ArgumentError, CCMError, get_version_from_build,
                            update_java_version, get_default_path, get_jdk_version_int,
                            platform_binary, rmdirs, validate_install_dir)
 from six.moves import urllib
@@ -33,12 +33,24 @@ OPSC_ARCHIVE = "http://downloads.datastax.com/enterprise/opscenter-%s.tar.gz"
 ARCHIVE = "http://archive.apache.org/dist/cassandra"
 GIT_REPO = "https://gitbox.apache.org/repos/asf/cassandra.git"
 GITHUB_REPO = "https://github.com/apache/cassandra.git"
+GIT_REPO = GITHUB_REPO
 GITHUB_TAGS = "https://api.github.com/repos/apache/cassandra/git/refs/tags"
 CCM_CONFIG = ConfigParser.RawConfigParser()
 CCM_CONFIG.read(os.path.join(os.path.expanduser("~"), ".ccm", "config"))
+DEFAULT_ALIASES = {'cassandra': 'https://github.com/apache/cassandra',
+                   'apollo': 'https://github.com/riptano/apollo',
+                   'bdp': 'https://github.com/riptano/bdp'}
+
+COMMON_GRADLE_OPTIONS = ['--parallel',
+                         '--build-cache',
+                         '-PuseRemoteBuildCache=true',
+                         '-Dorg.gradle.internal.repository.max.tentatives=20',
+                         '-Dorg.gradle.internal.repository.initial.backoff=1000',
+                         '-Dorg.gradle.internal.http.connectionTimeout=60000',
+                         '-Dorg.gradle.internal.http.socketTimeout=120000']
 
 
-def setup(version, verbose=False):
+def setup(version, verbose=False, ddac=False):
     binary = True
     fallback = True
 
@@ -84,11 +96,14 @@ def setup(version, verbose=False):
         alias = version.split(":")[1].split("/")[0]
         try:
             git_repo = CCM_CONFIG.get("aliases", alias)
-            clone_development(git_repo, version, verbose=verbose, alias=True)
-            return (directory_name(version), None)
         except ConfigParser.NoOptionError as e:
-            common.warning("Unable to find alias {} in configuration file.".format(alias))
-            raise e
+            if alias in DEFAULT_ALIASES:
+                git_repo = DEFAULT_ALIASES[alias]
+            else:
+                common.warning("Unable to find alias {} in configuration file.".format(alias))
+                raise e
+        clone_development(git_repo, version, verbose=verbose, alias=True)
+        return (directory_name(version), None)
 
     if version in ('stable', 'oldstable', 'testing'):
         version = get_tagged_version_numbers(version)[0]
@@ -134,13 +149,16 @@ def setup_opscenter(opscenter, username, password, verbose=False):
 
 def validate(path):
     if path.startswith(__get_dir()):
-        _, version = os.path.split(os.path.normpath(path))
+        head, version = os.path.split(os.path.normpath(path))
+        if version == 'dse-db':
+            # for dse-db clusters the version is not the final path element but one level up
+            _, version = os.path.split(head)
         setup(version)
 
 
 def clone_development(git_repo, version, verbose=False, alias=False):
     print_(git_repo, version)
-    target_dir = directory_name(version)
+    target_dir = directory_name(version, fix_dse_db=False)
     assert target_dir
     if 'github' in version:
         git_repo_name, git_branch = github_username_and_branch_name(version)
@@ -243,10 +261,7 @@ def clone_development(git_repo, version, verbose=False, alias=False):
                 process = subprocess.Popen(['git', 'pull'], cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 out, _, _ = log_info(process, logger)
                 assert out == 0, "Could not do a git pull"
-                process = subprocess.Popen([platform_binary('ant'), 'realclean'], cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                out, _, _ = log_info(process, logger)
-                assert out == 0, "Could not run 'ant realclean'"
-
+                clean(target_dir)
                 # now compile
                 compile_version(git_branch, target_dir, verbose)
             elif re.search('\[.*?(ahead|behind).*?\]', status.decode("utf-8")) is not None:  # status looks like  '## trunk...origin/trunk [ahead 1, behind 29]\n'
@@ -381,8 +396,74 @@ def download_version(version, url=None, verbose=False, binary=False):
             raise CCMError("Building C* version {} failed. Attempted to delete {} but failed. This will need to be manually deleted".format(version, target_dir))
         raise e
 
+    return version
+
+def clean(target_dir):
+    is_bdp_repo = os.path.exists(os.path.join(target_dir, 'dse-db'))
+    if is_bdp_repo:
+        clean_bdp(target_dir)
+    else:
+        clean_legacy(target_dir)
+
+def clean_bdp(target_dir):
+    env = common.update_java_version(install_dir=target_dir, for_build=True, info_message='DSE-DB clean')
+
+    logfile = lastlogfilename()
+    logger = get_logger(logfile)
+
+    process = subprocess.Popen([platform_binary('./gradlew'), 'clean'] + COMMON_GRADLE_OPTIONS,
+                               env=env, cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ret_val, _, _ = log_info(process, logger)
+    if ret_val is not 0:
+        raise CCMError("Error cleaning DSE-DB. See {logfile} for details.".format(logfile=logfile))
+
+def clean_legacy(target_dir):
+    env = common.update_java_version(install_dir=target_dir, for_build=True, info_message='Cassandra clean')
+
+    logfile = lastlogfilename()
+    logger = get_logger(logfile)
+
+    process = subprocess.Popen([platform_binary('ant'), 'realclean'], env=env, cwd=target_dir,
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    ret_val, _, _ = log_info(process, logger)
+    if ret_val is not 0:
+        raise CCMError("Error cleaning Cassandra. See {logfile} for details.".format(logfile=logfile))
 
 def compile_version(version, target_dir, verbose=False):
+    is_bdp_repo = os.path.exists(os.path.join(target_dir, 'dse-db'))
+    if is_bdp_repo:
+        compile_bdp_version(version, target_dir, verbose=verbose)
+    else:
+        compile_legacy_version(version, target_dir, verbose=verbose)
+
+
+def compile_bdp_version(version, target_dir, verbose=False):
+    env = common.update_java_version(install_dir=target_dir, for_build=True, info_message='DSE-DB {} compilation'.format(version))
+
+    logfile = lastlogfilename()
+    logger = get_logger(logfile)
+
+    common.info("Compiling DSE-DB {} ...".format(version))
+    logger.info("--- DSE-DB Build -------------------\n")
+
+    try:
+        process = subprocess.Popen([platform_binary('./gradlew'), ':dse-db:jar',
+                                    '--stacktrace', '--info'] + COMMON_GRADLE_OPTIONS,
+                                   env=env, cwd=target_dir, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        ret_val, out, err = log_info(process, logger)
+        print_("OUT:\n%s" % out)
+        print_("ERR:\n%s" % err)
+        if ret_val is not 0:
+            raise CCMError('Error compiling DSE-DB. See {logfile} or run '
+                           '"ccm showlastlog" for details'.format(logfile=logfile))
+    except OSError as e:
+        print_("Exception:\n%s" % e)
+        raise CCMError("Error compiling DSE-DB. See %s for details" % logfile)
+
+
+def compile_legacy_version(version, target_dir, verbose=False):
+    env = common.update_java_version(install_dir=target_dir, info_message='Cassandra {} compilation'.format(version))
+
     # compiling cassandra and the stress tool
     logfile = lastlogfilename()
     logger = get_logger(logfile)
@@ -455,10 +536,13 @@ def compile_version(version, target_dir, verbose=False):
                            "still be able to use ccm but not the stress related commands)" % str(e))
 
 
-def directory_name(version):
+def directory_name(version, fix_dse_db=True):
     version = version.replace(':', 'COLON')  # handle git branches like 'git:trunk'.
     version = version.replace('/', 'SLASH')  # handle git branches like 'github:mambocab/trunk'.
-    return os.path.join(__get_dir(), version)
+    res = os.path.join(__get_dir(), version)
+    if fix_dse_db:
+        res = common.fix_bdp_dse_db_install_dir(res)
+    return res
 
 
 def github_username_and_branch_name(version):

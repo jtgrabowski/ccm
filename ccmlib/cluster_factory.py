@@ -32,11 +32,14 @@ class ClusterFactory():
             cassandra_version = None
             if 'cassandra_version' in data:
                 cassandra_version = LooseVersion(data['cassandra_version'])
+            dse_version = None
+            if 'dse_version' in data:
+                dse_version = LooseVersion(data['dse_version'])
 
             if common.isDse(install_dir):
                 cluster = DseCluster(path, data['name'], install_dir=install_dir, create_directory=False, derived_cassandra_version=cassandra_version)
             else:
-                cluster = Cluster(path, data['name'], install_dir=install_dir, create_directory=False, derived_cassandra_version=cassandra_version)
+                cluster = Cluster(path, data['name'], install_dir=install_dir, create_directory=False, derived_cassandra_version=cassandra_version, derived_dse_version=dse_version)
             node_list = data['nodes']
             seed_list = data['seeds']
             if 'partitioner' in data:

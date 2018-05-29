@@ -5,7 +5,6 @@
 from __future__ import absolute_import
 
 import copy
-import fnmatch
 import logging
 import os
 import platform
@@ -21,7 +20,7 @@ from distutils.version import LooseVersion  #pylint: disable=import-error, no-na
 
 import six
 import yaml
-from six import print_
+from six import print_, string_types
 
 BIN_DIR = "bin"
 CASSANDRA_CONF_DIR = "conf"
@@ -35,6 +34,7 @@ LOG4J_TOOL_CONF = "log4j-tools.properties"
 LOGBACK_CONF = "logback.xml"
 LOGBACK_TOOLS_CONF = "logback-tools.xml"
 CASSANDRA_ENV = "cassandra-env.sh"
+JVM_DEPENDENT_SH = "jvm-dependent.sh"  # since DSE 6.8
 CASSANDRA_WIN_ENV = "cassandra-env.ps1"
 CASSANDRA_SH = "cassandra.in.sh"
 
@@ -74,6 +74,10 @@ LOG = logging.getLogger('ccm')
 LOG.setLevel(logging.DEBUG)
 LOG.addHandler(INFO_HANDLER)
 LOG.addHandler(ERROR_HANDLER)
+
+# If set to True, a node should not rotate logfiles to make sure, that intermittent test
+# failures due to log file rotation don't happen. See DB-2759.
+DONT_ROTATE_LOGFILES = False
 
 
 def error(msg):
@@ -214,6 +218,63 @@ def switch_cluster(path, new_name):
         f.write(new_name + '\n')
 
 
+def substitute_in_files(files, substitutions):
+    """
+    Replaces one or more patterns in one or more files. Unlike replace_in_file this method does
+    not replace the whole line but just the parts of the line that matches the regular expression.
+    Operates on a per-line basis, like replace_in_file, so greedy matches do match at max a single
+    line in a file.
+    Unlike replace_in_file, non-existing files are ignored.
+
+    Example invocations:
+        common.substitute_in_files('some_file_name', [regex, substritute])
+        common.substitute_in_files('some_file_name', [[regex_a, substritute_for_a],
+                                                      [regex_b, substritute_for_b]])
+        common.substitute_in_files([filename_a, filename_b], [regex, substritute])
+        common.substitute_in_files([filename_a, filename_b], [[regex_a, substritute_for_a],
+                                                              [regex_b, substritute_for_b]])
+
+    :param files: can be a single filename or a list of filenames
+    :param substitutions: can be a single substitution, pair of pattern and replacement, or a list of substritutions
+    """
+
+    # ensure files is a list of files
+    files = files if isinstance(files, list) else [files]
+
+    if not isinstance(substitutions, list) or len(substitutions) == 0:
+        raise ValueError("invalid value in substitutions")
+    # make substitutions a list of lists in case the caller just provided a single [regex, substitute] instead
+    # of a list of those
+    if len(substitutions) == 2 and not isinstance(substitutions[0], list) and not isinstance(substitutions[1], list):
+        substitutions = [substitutions]
+
+    # validate substitutions parameter
+    for subst in substitutions:
+        if not isinstance(subst, list) or len(subst) != 2:
+            raise ValueError("invalid value in substitutions")
+        subst[0] = re.compile(subst[0])
+
+    for file in files:
+        if os.path.exists(file):
+            file_tmp = file + "." + str(os.getpid()) + ".tmp"
+            try:
+                with open(file, 'r') as f:
+                    with open(file_tmp, 'w') as f_tmp:
+                        _substitute_in_list(f, substitutions, lambda line: f_tmp.write(line))
+                shutil.move(file_tmp, file)
+            finally:
+                # delete the temp file, if either the substitution of shutil.move fails
+                if os.path.exists(file_tmp):
+                    os.unlink(file_tmp)
+
+
+def _substitute_in_list(input, substitutions, output):
+    for line in input:
+        for pat, sub in substitutions:
+            line = pat.sub(sub, line)
+        output(line)
+
+
 def replace_in_file(file, regexp, replace):
     replaces_in_file(file, [(regexp, replace)])
 
@@ -301,8 +362,16 @@ def make_cassandra_env(install_dir, node_path, update_conf=True):
     env['CASSANDRA_INCLUDE'] = os.path.join(dst)
     env['MAX_HEAP_SIZE'] = os.environ.get('CCM_MAX_HEAP_SIZE', '500M')
     env['HEAP_NEWSIZE'] = os.environ.get('CCM_HEAP_NEWSIZE', '50M')
+    env['MAX_DIRECT_MEMORY'] = os.environ.get('CCM_MAX_DIRECT_SIZE', '2048M') # no effect before 6.0
     env['CASSANDRA_HOME'] = install_dir
     env['CASSANDRA_CONF'] = os.path.join(node_path, 'conf')
+
+    if CASSANDRA_CONF != 'cassandra.yaml':
+        # the yaml file can be changed because of different deployments, in which case we must ensure
+        # that standalone tools also use it, since otherwise they would use the default cassandra.yaml
+        # whose folders point to the wrong location since only CASSANDRA_CONF is amended to point to the test dir
+        env['JVM_OPTS'] = os.environ.get('JVM_OPTS', '') \
+            + '-Dcassandra.config=file:////{} '.format(os.path.join(env['CASSANDRA_CONF'], CASSANDRA_CONF))
 
     return env
 
@@ -312,6 +381,7 @@ def make_dse_env(install_dir, node_path, node_ip):
     env = os.environ.copy()
     env['MAX_HEAP_SIZE'] = os.environ.get('CCM_MAX_HEAP_SIZE', '500M')
     env['HEAP_NEWSIZE'] = os.environ.get('CCM_HEAP_NEWSIZE', '50M')
+    env['MAX_DIRECT_MEMORY'] = os.environ.get('CCM_MAX_DIRECT_SIZE', '2048M') # no effect before 6.0
     if version < '6.0':
         env['SPARK_WORKER_MEMORY'] = os.environ.get('SPARK_WORKER_MEMORY', '1024M')
         env['SPARK_WORKER_CORES'] = os.environ.get('SPARK_WORKER_CORES', '2')
@@ -510,6 +580,13 @@ def validate_install_dir(install_dir):
         raise ArgumentError('%s does not appear to be a cassandra or dse installation directory' % install_dir)
 
 
+def fix_bdp_dse_db_install_dir(install_dir):
+    maybe_dsedb_dir = os.path.join(install_dir, 'dse-db')
+    if os.path.exists(maybe_dsedb_dir):
+        install_dir = maybe_dsedb_dir
+    return install_dir
+
+
 def assert_socket_available(itf):
     info = socket.getaddrinfo(itf[0], itf[1], socket.AF_UNSPEC, socket.SOCK_STREAM)
     if not info:
@@ -636,7 +713,82 @@ def copy_directory(src_dir, dst_dir):
             shutil.copy(filename, dst_dir)
 
 
-def get_version_from_build(install_dir=None, node_path=None, cassandra=False):
+def get_cassandra_version_from_build(install_dir=None, node_path=None, cassandra=False):
+    return get_version_from_build(install_dir, node_path, cassandra, ignore_dse=True)
+
+
+def get_version_from_build(install_dir=None, node_path=None, cassandra=False, ignore_dse=False):
+    if install_dir is None and node_path is not None:
+        install_dir = get_install_dir_from_cluster_conf(node_path)
+    build_properties = None
+    build_gradle = None
+    if install_dir is not None:
+        # Binary cassandra installs will have a 0.version.txt file
+        version_file = os.path.join(install_dir, '0.version.txt')
+        if os.path.exists(version_file):
+            with open(version_file) as f:
+                return LooseVersion(f.read().strip())
+
+        if not ignore_dse:
+            # For DSE look for a dse*.jar and extract the version number
+            dse_version = get_dse_version(install_dir)
+            if dse_version is not None:
+                if cassandra:
+                    return get_dse_cassandra_version(install_dir)
+                else:
+                    return LooseVersion(dse_version)
+
+        # Source cassandra installs we can read from build.xml
+        build = os.path.join(install_dir, 'build.xml')
+        if os.path.exists(build):
+            with open(build) as f:
+                for line in f:
+                    match = re.search('name="base\.version" value="([0-9.]+)[^"]*"', line)
+                    if match:
+                        return LooseVersion(match.group(1))
+
+        # Since DB-1701 the "cassandraBaseVersion" is in build.properties - before
+        # that number was hard coded in dse-db/build.gradle. Leave that backward
+        # compatibility here, it is required for DSE 5.0, 5.1 + 6.0 builds.
+
+        if os.path.basename(os.path.abspath(install_dir)) == 'dse-db':
+            # discover version from already fixed install dir
+            build_properties = os.path.join(install_dir, '..', 'build.properties')
+            build_gradle = os.path.join(install_dir, 'build.gradle')
+        else:
+            # discover version from cloned repo
+            build_properties = os.path.join(install_dir, 'build.properties')
+            build_gradle = os.path.join(install_dir, 'dse-db', 'build.gradle')
+
+        # For dse-db clusters from the bdp repo we can read from build.properties
+        # (since DSE 6.7)
+        if os.path.exists(build_properties):
+            with open(build_properties) as f:
+                for line in f:
+                    match = re.search("cassandraBaseVersion = ([0-9.]+)[^']", line)
+                    if match:
+                        return LooseVersion(match.group(1))
+
+        # For dse-db clusters from the bdp repo we can read from build.gradle
+        # (DSE 5.0, 5.1, 6.0)
+        if os.path.exists(build_gradle):
+            with open(build_gradle) as f:
+                for line in f:
+                    match = re.search("version = '([0-9.]+)[^']*", line)
+                    if match:
+                        return LooseVersion(match.group(1))
+
+    raise CCMError("Cannot find version in install dir {} - build_properties={}  build_gradle={}".format(install_dir, build_properties, build_gradle))
+
+
+def get_dse_version_from_build(install_dir=None, node_path=None):
+    dse_version = get_dse_version_from_build_safe(install_dir=install_dir, node_path=node_path)
+    if not dse_version:
+        raise Exception("Cannot find DSE version from install_dir=%s node_path=%s" % (install_dir, node_path))
+    return dse_version
+
+
+def get_dse_version_from_build_safe(install_dir=None, node_path=None):
     if install_dir is None and node_path is not None:
         install_dir = get_install_dir_from_cluster_conf(node_path)
     if install_dir is not None:
@@ -647,19 +799,29 @@ def get_version_from_build(install_dir=None, node_path=None, cassandra=False):
                 return LooseVersion(f.read().strip())
         # For DSE look for a dse*.jar and extract the version number
         dse_version = get_dse_version(install_dir)
-        if (dse_version is not None):
-            if cassandra:
-                return get_dse_cassandra_version(install_dir)
-            else:
-                return LooseVersion(dse_version)
+        if dse_version is not None:
+            return LooseVersion(dse_version)
         # Source cassandra installs we can read from build.xml
         build = os.path.join(install_dir, 'build.xml')
-        with open(build) as f:
-            for line in f:
-                match = re.search('name="base\.version" value="([0-9.]+)[^"]*"', line)
-                if match:
-                    return LooseVersion(match.group(1))
-    raise CCMError("Cannot find version")
+        if os.path.exists(build):
+            with open(build) as f:
+                for line in f:
+                    match = re.search('name="base\.dse\.version" value="([0-9.]+)[^"]*"', line)
+                    if match:
+                        return LooseVersion(match.group(1))
+        # if this is a dsedb install from the bdp repo, we just look up the normal dse version
+        bdp_dir = None
+        # detect if install_dir points to bdp repo root or dse-db subdir
+        if os.path.basename(os.path.abspath(install_dir)) == 'dse-db':
+            bdp_dir = os.path.join(os.path.abspath(install_dir), os.pardir)
+        elif os.path.exists(os.path.join(install_dir, 'dse-db')):
+            bdp_dir = install_dir
+        if bdp_dir:
+            bdp_version_txt = os.path.join(bdp_dir, 'VERSION.txt')
+            if os.path.exists(bdp_version_txt):
+                with open(bdp_version_txt) as f:
+                    return LooseVersion(f.read().strip())
+    return None
 
 
 def get_dse_version(install_dir):
@@ -679,7 +841,7 @@ def get_dse_cassandra_version(install_dir):
     if match:
         return LooseVersion(match.group(1))
 
-    raise ArgumentError("Unable to determine Cassandra version in: %s.\n\tstdout: '%s'\n\tstderr: '%s'" 
+    raise ArgumentError("Unable to determine Cassandra version in: %s.\n\tstdout: '%s'\n\tstderr: '%s'"
       % (install_dir, output, stderr))
 
 def get_install_dir_from_cluster_conf(node_path):
@@ -741,16 +903,18 @@ def _get_jdk_version(version):
     return re.search(ver_pattern, str(version)).groups()[0] + ".0"
 
 
-def update_java_version(jvm_version=None, install_dir=None, cassandra_version=None, env=None,
+def update_java_version(jvm_version=None, install_dir=None, dse_version=None, cassandra_version=None, env=None,
                         for_build=False, info_message=None):
     """
     Updates or fixes the Java version (JAVA_HOME environment).
     If 'jvm_version' is explicitly set, that one will be used.
-    Otherwise, the Java version will be guessed from the provided 'cassandra_version' parameter.
+    Otherwise, the Java version will be guessed from the provided 'dse_version' and 'cassandra_version' parameters.
     If the version-parameters are not specified, those will be inquired from the 'install_dir'.
-    See CASSANDRA-15835
+
     :param jvm_version: The Java version to use - must be the major Java version number like 8 or 11.
     :param install_dir: Software installation directory.
+    :param dse_version: The DSE version to consider for choosing the correct Java version. This one takes
+    precedence over 'cassandra_version'.
     :param cassandra_version: The Cassandra version to consider for choosing the correct Java version.
     :param env: Current OS environment variables.
     :param for_build: whether the code should check for a valid version to build or run bdp. Currently only
@@ -762,82 +926,106 @@ def update_java_version(jvm_version=None, install_dir=None, cassandra_version=No
 
     env = env if env else os.environ
 
-    current_java_version = get_jdk_version_int()
-    current_java_home_version = get_jdk_version_int('{}/bin/java'.format(env['JAVA_HOME'])) if 'JAVA_HOME' in env else current_java_version
-    # Code to ensure that we start C* using the correct Java version.
-    # This is important especially after CASSANDRA-9608 (Java 11 support) when dtests are run using Java 11
+    # Code to ensure that we start DSE/C* using the correct Java version.
+    # This is important especially after DB-468 (Java 11 support) when dtests are run using Java 11
     # but a "manually" configured (set_install_dir()) different version requires Java 8.
-    return _update_java_version(current_java_version, current_java_home_version,
-                                jvm_version=jvm_version, install_dir=install_dir,
+    current_jdk_version = float(get_jdk_version('{}/bin/java'.format(env['JAVA_HOME']) if 'JAVA_HOME' in env else 'java'))
+    # Make it Java 8 instead of 1.8 (or 7 instead of 1.7)
+    current_jdk_version = int(current_jdk_version if current_jdk_version >= 2 else 10*(current_jdk_version-1))
+
+    return _update_java_version(current_jdk_version,
+                                jvm_version=jvm_version, install_dir=install_dir, dse_version=dse_version,
                                 cassandra_version=cassandra_version, env=env,
                                 for_build=for_build, info_message=info_message)
 
 
-def _update_java_version(current_java_version, current_java_home_version,
-                         jvm_version=None, install_dir=None, cassandra_version=None, env=None,
-                         for_build=False, info_message=None, os_env=None):
+def _update_java_version(current_jdk_version,
+                         jvm_version=None, install_dir=None, dse_version=None, cassandra_version=None, env=None,
+                         for_build=False, info_message=None):
     # Internal variant accessible for tests
 
     if env is None:
         raise RuntimeError("env passed to _update_java_version must not be None")
 
+    if dse_version is None and install_dir:
+        dse_version = get_dse_version_from_build_safe(install_dir)
     if cassandra_version is None and install_dir:
         cassandra_version = get_version_from_build(install_dir)
 
     # conservative Java version defaults
-    # Cassandra versions 3.x and 2.x use the defaults
     build_versions = [8]
     run_versions = [8]
 
-    info('{}: current_java_version={}, current_java_home_version={}, jvm_version={}, for_build={}, cassandra_version={}, install_dir={}, env={}'
-         .format(info_message, current_java_version, current_java_home_version, jvm_version, for_build, cassandra_version, install_dir, env))
-
-    if cassandra_version >= '4.0':
-        if not os_env:
-            os_env = os.environ
-        if 'CASSANDRA_USE_JDK11' not in os_env:
-            build_versions = [8, 11]
-            run_versions = [8, 11, 12, 13, 14, 15, 16, 17]
-        else:
-            build_versions = [11]
-            run_versions = [11]
-
-    versions = build_versions if for_build else run_versions
-
     if not jvm_version:
-        if current_java_version in versions:
-            jvm_version = current_java_version
+        if dse_version:
+            # Use the build-env.yaml file introduced with DB-468 to gather the allowed Java versions
+            if install_dir:
+                build_env_file = os.path.join(install_dir, 'build-env.yaml')
+                if not os.path.exists(build_env_file):
+                    # if 'install_dir' points into the 'dse-db' folder, try the parent directory
+                    build_env_file = os.path.join(install_dir, '..', 'build-env.yaml')
+            else:
+                build_env_file = None
+            if '6.8' <= dse_version < '6.9':
+                # DSP-468 - Java 8 + 11 for DSE 6.8
+                build_versions = [11, 8]
+                run_versions = [8] # DSE 6.8 doesn't officially support Java 11, so don't try to it against Java 11
+            elif build_env_file and os.path.exists(build_env_file):
+                # build-env.yaml contains an "array" of valid Java versions for tests in 'java_runtime_versions'.
+                # Note that we only have that file in the bdp source tree.
+                with open(build_env_file, 'r') as stream:
+                    build_env = yaml.safe_load(stream)
+                    build_versions = build_env['java_build_versions']
+                    run_versions = build_env['java_runtime_versions']
+            elif dse_version >= '7.0':
+                # DSP-20483 - Java 11 only for DSE 7.0/DCE 1.0
+                build_versions = [11]
+                run_versions = [11, 12, 13, 14, 15]
+            # DSE versions 5.0-6.7 use the defaults
+            elif dse_version < '5.0':
+                build_versions = [8]
+                run_versions = [8]  # don't use Java 7
         else:
-            for version in versions:
-                if 'JAVA{}_HOME'.format(version) in env:
-                    jvm_version = version
-                    break
+            if cassandra_version >= '4.0':
+                build_versions = [8, 11]
+                run_versions = [8, 11, 12, 13]
+            # Cassandra versions 3.x use the defaults
+            elif cassandra_version < '3.0':
+                build_versions = [8]
+                run_versions = [8]  # don't use Java 7
+
+        if for_build:
+            if current_jdk_version != build_versions[-1]:
+                jvm_version = build_versions[-1]
+            # Check for the _additional_ JAVAn_HOME variables that need to be set.
+            for check_version in build_versions[:-1]:
+                check_env = 'JAVA{}_HOME'.format(check_version)
+                if check_env not in env:
+                    raise RuntimeError("Building DSE {} requires the environment to contain {}, but (at least) {} is missing"
+                                       .format(dse_version, ' and '.join(['JAVA{}_HOME'.format(v) for v in build_versions[:-1]]), check_env))
+        else:
+            if current_jdk_version not in run_versions and len(run_versions) >= 1:
+                jvm_version = run_versions[0]
 
         if jvm_version:
-            info('{}: using Java {} for the current invocation'
-                 .format(info_message, jvm_version))
+            warning('{}: Java {} is incompatible to DSE {}/Cassandra {}, using Java {} for the current invocation'
+                    .format(info_message, current_jdk_version, dse_version, cassandra_version, jvm_version))
     else:
         # Called proved an explicit Java version
-        info('{}: Using explicitly requested Java version {} for the current invocation of Cassandra {}'
-             .format(info_message, jvm_version, cassandra_version))
+        info('{}: Using explicitly requested Java version {} for the current invocation of DSE {}/Cassandra {}'
+             .format(info_message, jvm_version, dse_version, cassandra_version))
 
-    # If the 'java' binary accessible via PATH points to a different Java version than the current JAVA_HOME,
-    # update it to point to the Java version of the 'java' binary accessible via PATH.
-    # Need to do this, because ccmlib.common.compile_version() uses the 'java' binary accessible via PATH via 'ant'.
-    if not jvm_version:
-        if current_java_home_version != current_java_version:
-            jvm_version = current_java_version
-            info('{}: Using Java {} for Cassandra {}, because the Java versions of java binary in PATH ({}) and '
-                 'JAVA_HOME ({}) did not match'.format(info_message, current_java_version, cassandra_version,
-                                                       current_java_version, current_java_home_version))
-        else:
-            jvm_version = current_java_version
-
-    if current_java_version != jvm_version or current_java_home_version != jvm_version:
+    if jvm_version:
         new_java_home = 'JAVA{}_HOME'.format(jvm_version)
         if new_java_home not in env:
-            raise RuntimeError("{}: You need to set JAVA{}_HOME to run Cassandra {}"
-                               .format(info_message, jvm_version, cassandra_version))
+            if for_build:
+                raise RuntimeError("You need to set {} to build DSE {}/Cassandra {}"
+                                   .format(' and '.join(['JAVA{}_HOME'.format(v) for v in build_versions]),
+                                           dse_version, cassandra_version))
+            else:
+                raise RuntimeError("You need to set {} to run DSE {}/Cassandra {}"
+                                   .format(' or '.join(['JAVA{}_HOME'.format(v) for v in run_versions]),
+                                           dse_version, cassandra_version))
         env['JAVA_HOME'] = env[new_java_home]
         env['PATH'] = '{}/bin:{}'.format(env[new_java_home], env['PATH'] if 'PATH' in env else '')
     return env
@@ -923,3 +1111,113 @@ def get_default_signals():
     else:
         default_signal_events = {'1': signal.SIGHUP, '9': signal.SIGKILL}
     return default_signal_events
+
+
+def watch_log_for(log_file, exprs, filename, name, from_mark=None, timeout=600,
+                  is_running=lambda: True):
+    start = time.time()
+    tofind = [exprs] if isinstance(exprs, string_types) else exprs
+    tofind = [re.compile(e) for e in tofind]
+    matchings = []
+    reads = ""
+    if len(tofind) == 0:
+        return None
+
+    output_read = False
+    while not os.path.exists(log_file):
+        time.sleep(.5)
+        if start + timeout < time.time():
+            raise TimeoutError(time.strftime("%d %b %Y %H:%M:%S", time.gmtime()) + " [" + name + "] Timed out waiting for {} to be created.".format(log_file))
+
+    start = time.time()  # Reset start time after log file appeared (since it may eat several seconds)
+    f = None
+    try:
+        f = open(log_file)
+
+        # If 'from_mark' has been specified and the file size is smaller, then the log file has
+        # been rotated and the expected log message might have been missed. Log a warning in that case.
+        if not from_mark:
+            from_mark = 0
+        else:
+            file_size = os.path.getsize(log_file)
+            if file_size < from_mark:
+                warning("Detected rotation of {} log file {}. "
+                        "Some log entries might be missed and cause the function to fail. "
+                        "from_mark = {}, file size = {}"
+                        .format(name, filename, from_mark, file_size))
+                from_mark = 0
+            f.seek(from_mark)
+
+        while True:
+            # Python 2.7 on OSX fails to recognize newly added lines to the file we're watching here.
+            # This seek/tell combination, as silly as it may look, works around that issue on OSX.
+            # See DB-2820 for a code sample.
+            f.seek(f.tell())
+
+            # Read and check as much as we can read at once.
+            # I.e. prevent checking the process status after every line.
+            lines = f.readlines()
+
+            # If there are no more lines in the log and the process is not running,
+            # then we timeout early
+            if not lines and not is_running():
+                raise TimeoutError(time.strftime("%d %b %Y %H:%M:%S", time.gmtime()) + " [" + name + "] Process has finished but pattern is still missing: " +
+                                   str([e.pattern for e in tofind]) + ":\n" + reads[:50] + ".....\nSee {} for remainder".format(filename))
+
+            for line in lines:
+                if line and line.endswith('\n'):  # Do not consider incomplete lines (without a trailing newline)
+                    from_mark = f.tell()
+                    reads = reads + line
+                    for e in tofind:
+                        m = e.search(line)
+                        if m:
+                            matchings.append((line, m))
+                            tofind.remove(e)
+                            if len(tofind) == 0:
+                                return matchings[0] if isinstance(exprs, string_types) else matchings
+                else:
+                    break
+
+            if start + timeout < time.time():
+                raise TimeoutError(time.strftime("%d %b %Y %H:%M:%S", time.gmtime()) + " [" + name + "] Missing: " + str([e.pattern for e in tofind]) + ":\n" + reads[:50] + ".....\nSee {} for remainder".format(filename))
+
+            # Yep, it's ugly. Don't sleep long to (hopefully) not miss a message in a rotated log file.
+            time.sleep(.2)
+
+            # Try to detect log file rotation. If the size of the file via os.path.getsize() is
+            # smaller than the 'from_mark', a log file rotation happened. Since we only get here,
+            # when there is no more data to read from the previously opened file handle, simply
+            # close the old file handle and reopen the file.
+            file_size = os.path.getsize(log_file)
+            if file_size < from_mark:
+                warning("Detected rotation of {} log file {}".format(name, filename))
+                f.close()
+                f = open(log_file)
+                from_mark = 0
+                continue
+    finally:
+        if f:
+            f.close()
+
+
+def set_logback_no_rotation(logback_config_file):
+    if os.path.exists(logback_config_file):
+        with open(logback_config_file) as src:
+            logback_config = "".join(src.readlines())
+
+        logback_config = re.sub(r'ch\.qos\.logback\.core\.rolling\.RollingFileAppender',
+                                'ch.qos.logback.core.FileAppender',
+                                logback_config)
+
+        # A non-greedy variant of that regex would be nicer than the loop
+        #   regex_total_size = r'<rollingPolicy .*</rollingPolicy>'
+        #   logback_config = re.sub(regex_total_size, '', logback_config, flags=re.DOTALL + re.MULTILINE)
+        while True:
+            i = logback_config.find('<rollingPolicy')
+            e = logback_config.find('</rollingPolicy>')
+            if i < 0 or e < 0:
+                break
+            logback_config = logback_config[0:i] + logback_config[e + len('</rollingPolicy>'):]
+
+        with open(logback_config_file, 'w') as dst:
+            dst.write(logback_config)

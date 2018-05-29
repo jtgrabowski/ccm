@@ -151,13 +151,13 @@ class NodeStartCmd(Cmd):
 
     options_list = [
         (['-v', '--verbose'], {'action': "store_true", 'dest': "verbose", 'help': "Print standard output of cassandra process", 'default': False}),
-        (['--no-wait'], {'action': "store_true", 'dest': "no_wait", 'help': "Do not wait for cassandra node to be ready", 'default': False}),
         (['--wait-other-notice'], {'action': "store_true", 'dest': "deprecate", 'help': "DEPRECATED/IGNORED: Use '--skip-wait-other-notice' instead. This is now on by default.", 'default': False}),
         (['--skip-wait-other-notice'], {'action': "store_false", 'dest': "wait_other_notice", 'help': "Skip waiting until all live nodes of the cluster have marked the other nodes UP", 'default': True}),
         (['--wait-for-binary-proto'], {'action': "store_true", 'dest': "wait_for_binary_proto", 'help': "Wait for the binary protocol to start", 'default': False}),
         (['-j', '--dont-join-ring'], {'action': "store_true", 'dest': "no_join_ring", 'help': "Launch the instance without joining the ring", 'default': False}),
         (['--replace-address'], {'type': "string", 'dest': "replace_address", 'default': None, 'help': "Replace a node in the ring through the cassandra.replace_address option"}),
         (['--jvm_arg'], {'action': "append", 'dest': "jvm_args", 'help': "Specify a JVM argument", 'default': []}),
+        (['--jvm_version'], {'action': "append", 'dest': "jvm_version", 'help': "Specify a JVM version (e.g. 8 or 11)", 'default': []}),
         (['--quiet-windows'], {'action': "store_true", 'dest': "quiet_start", 'help': "Pass -q on Windows 2.2.4+ and 3.0+ startup. Ignored on linux.", 'default': False}),
         (['--root'], {'action': "store_true", 'dest': "allow_root", 'help': "Allow CCM to start cassandra as root", 'default': False}),
     ]
@@ -170,12 +170,12 @@ class NodeStartCmd(Cmd):
     def run(self):
         try:
             self.node.start(not self.options.no_join_ring,
-                            no_wait=self.options.no_wait,
                             wait_other_notice=self.options.wait_other_notice,
                             wait_for_binary_proto=self.options.wait_for_binary_proto,
                             verbose=self.options.verbose,
                             replace_address=self.options.replace_address,
                             jvm_args=self.options.jvm_args,
+                            jvm_version=self.options.jvm_version,
                             quiet_start=self.options.quiet_start,
                             allow_root=self.options.allow_root)
         except NodeError as e:
