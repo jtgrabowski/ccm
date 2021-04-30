@@ -138,7 +138,7 @@ class Cluster(object):
         if any([node.data_center for node in self.nodes.values()]):
             self.update_topology_files()
 
-        if self.cassandra_version() >= '4':
+        if self.cassandra_version() >= '4' and not self.is_dse_cluster():
             self.set_configuration_options({ 'start_rpc' : None}, delete_empty=True, delete_always=True)
         else:
             self.set_configuration_options(common.CCM_40_YAML_OPTIONS, delete_empty=True, delete_always=True)
